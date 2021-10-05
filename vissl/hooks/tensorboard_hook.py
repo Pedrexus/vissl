@@ -254,14 +254,15 @@ class SSLTensorboardHook(ClassyHook):
             iteration <= 100 and iteration % 5 == 0
         ):
             logging.info(f"Logging metrics. Iteration {iteration}")
+            phase_type = "Training" if task.train else "Testing"
             self.tb_writer.add_scalar(
-                tag="Training/Loss",
+                tag=f"{phase_type}/Loss",
                 scalar_value=round(task.last_batch.loss.data.cpu().item(), 5),
                 global_step=iteration,
             )
 
             self.tb_writer.add_scalar(
-                tag="Training/Learning_rate",
+                tag=f"{phase_type}/Learning_rate",
                 scalar_value=round(task.optimizer.options_view.lr, 5),
                 global_step=iteration,
             )
