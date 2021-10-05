@@ -58,7 +58,6 @@ class SSLTensorboardHook(ClassyHook):
     SSL Specific variant of the Classy Vision tensorboard hook
     """
 
-    on_loss_and_meter = ClassyHook._noop
     on_backward = ClassyHook._noop
     on_step = ClassyHook._noop
 
@@ -160,6 +159,17 @@ class SSLTensorboardHook(ClassyHook):
                     f"Parameters/{name}", parameter, global_step=-1
                 )
 
+    def on_loss_and_meter(self, task: "tasks.ClassyTask") -> None:
+        phase_type = "Training" if task.train else "Testing"
+
+        if is_primary() and phase_type == "Testing":
+            # Log test loss
+            self.tb_writer.add_scalar(
+                tag=f"{phase_type}/Loss",
+                scalar_value=round(task.last_batch.loss.data.cpu().item(), 5),
+                global_step=task.iteration,
+            )
+
     def on_phase_end(self, task: "tasks.ClassyTask") -> None:
         """
         Called at the end of every epoch if the tensorboard hook is
@@ -181,13 +191,6 @@ class SSLTensorboardHook(ClassyHook):
                                 global_step=task.train_phase_idx,
                             )
 
-            # Log test loss
-            if phase_type == "Testing":
-                self.tb_writer.add_scalar(
-                    tag=f"{phase_type}/Loss",
-                    scalar_value=round(task.last_batch.loss.data.cpu().item(), 5),
-                    global_step=task.train_phase_idx,
-                )
         if not (self.log_params or self.log_params_gradients):
             return
 
