@@ -180,6 +180,14 @@ class SSLTensorboardHook(ClassyHook):
                                 scalar_value=round(acc, 5),
                                 global_step=task.train_phase_idx,
                             )
+
+            # Log test loss
+            if phase_type == "Testing":
+                self.tb_writer.add_scalar(
+                    tag=f"{phase_type}/Loss",
+                    scalar_value=round(task.last_batch.loss.data.cpu().item(), 5),
+                    global_step=task.train_phase_idx,
+                )
         if not (self.log_params or self.log_params_gradients):
             return
 
