@@ -12,6 +12,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from vissl.config import AttrDict, check_cfg_version
 from vissl.utils.io import save_file
+from vissl.utils.misc import is_augly_available
 
 
 def save_attrdict_to_disk(cfg: AttrDict):
@@ -451,7 +452,7 @@ def infer_losses_config(cfg):
             queue_length // world_size
         )
 
-    # some inference for Simdist loss.
+    # some inference for DINO loss.
     if cfg.LOSS.name == "dino_loss":
         assert len(cfg.MODEL.HEAD.PARAMS) == 1
         assert cfg.MODEL.HEAD.PARAMS[0][0] == "swav_head"
@@ -460,6 +461,16 @@ def infer_losses_config(cfg):
         cfg.DATA.TRAIN.COLLATE_FUNCTION = "multicrop_collator"
 
     return cfg
+
+
+def assert_transforms(cfg):
+    for transforms in [cfg.DATA.TRAIN.TRANSFORMS, cfg.DATA.TEST.TRANSFORMS]:
+        for transform in transforms:
+            if "transform_type" in transform:
+                assert transform["transform_type"] in [None, "augly"]
+
+                if transform["transform_type"] == "augly":
+                    assert is_augly_available(), "Please pip install augly."
 
 
 def infer_and_assert_hydra_config(cfg):
@@ -480,6 +491,7 @@ def infer_and_assert_hydra_config(cfg):
     """
     cfg = infer_losses_config(cfg)
     cfg = infer_learning_rate(cfg)
+    assert_transforms(cfg)
 
     # pass the seed to cfg["MODEL"] so that model init on different nodes can
     # use the same seed.
@@ -630,7 +642,6 @@ def infer_and_assert_hydra_config(cfg):
     # to FSDP from fairscale which doesn't know about AUTO_SETUP_FSDP
     del cfg.MODEL.FSDP_CONFIG["AUTO_SETUP_FSDP"]
     del cfg.MODEL.FSDP_CONFIG["AMP_TYPE"]
-    logging.info(f"Using the FSDP config: {cfg.MODEL.FSDP_CONFIG}")
 
     if cfg.DATA.TRAIN.BASE_DATASET == "generic_ssl":
         assert (
