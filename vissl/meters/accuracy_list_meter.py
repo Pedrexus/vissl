@@ -17,8 +17,16 @@ class AccuracyListMeter(ClassyMeter):
     """
     Meter to calculate top-k accuracy for single label image classification task.
 
-    Supports Single target and multiple output. A list of accuracy meters is
+    Supports multi-target and multiple output. A list of accuracy meters is
     constructed and each output has a meter associated.
+
+    Example:
+        target = [0 0 0 1 1]  # Correct classes are 0, 3
+
+        pred = [0.06, 0.41, 0.04, 0.39, 0.1]  # Top-1 prediction is 1, top-3 is 1, 3, 0
+
+        Accuracy@1: 0 correct = 0.0
+        Accuracy@3: 1 correct = 1.0
 
     Args:
         num_meters: number of meters and hence we have same number of outputs

@@ -37,6 +37,10 @@ defaults:
   # you must specify the base config you want to run
   - config: ???
 
+# By default, make hydra verbose
+hydra:
+  verbose: True
+
 ######################### versioning ###################################
 # this config version is checked with the VISSL latest config version in
 # vissl/config/__init__.py
@@ -83,6 +87,11 @@ config:
   # HOOKS
   # ----------------------------------------------------------------------------------- #
   HOOKS:
+    # ----------------------------------------------------------------------------------- #
+    # Whether or not to check if the loss or model_output is NaN.
+    # ----------------------------------------------------------------------------------- #
+    CHECK_NAN: True
+
     # ----------------------------------------------------------------------------------- #
     # Perf hooks for several steps of model training
     # ----------------------------------------------------------------------------------- #
@@ -413,14 +422,46 @@ config:
   # multiple meters are calculated for multiple model outputs (for example: multiple
   # layers output) and metric is calculated on the same input target.
   METERS:
+    # [DEPRECATED]: please use names below instead. This is the name of the meter.
     name: ""
+    # names of meters, corresponds to the string used in @register_meter method.
+    names: []
     # whether to calculate the meter during training as well. Sometimes, if the training
     # data size is too big, it could be hard to compute the meter on training set. Hence
     # we might want to disable it.
     enable_training_meter: True
+    # When model output mask is True, only classes present in the labels list will be
+    # considered for the meters. For example, if our labels only have 200 classes,
+    # but the model output has 1000 classes, the model output for 800 classes will
+    # be cast to -inf.
+    model_output_mask: False
     # calculate top-k meter on single target multiple ouput setting
     accuracy_list_meter:
       # number of accuracy meters. In cases like linear evaluation of feature, we perform
+      # evaluation of several layers and there's a separate meter for each layer.
+      # num_meters basically specifices number of meters.
+      num_meters: 1
+      # what topk values to calculate. Example topk_values = [1, 5] means top1 and top5
+      # both will be calculated
+      topk_values: [1]
+      # names of the meter. Useful in cases where we have several meters. For the linear
+      # feature evaluation workflows, meter name is automatically inferred.
+      meter_names: []
+    # calculate top-k meter on single target multiple ouput setting
+    precision_at_k_list_meter:
+      # number of precision meters. In cases like linear evaluation of feature, we perform
+      # evaluation of several layers and there's a separate meter for each layer.
+      # num_meters basically specifices number of meters.
+      num_meters: 1
+      # what topk values to calculate. Example topk_values = [1, 5] means top1 and top5
+      # both will be calculated
+      topk_values: [1]
+      # names of the meter. Useful in cases where we have several meters. For the linear
+      # feature evaluation workflows, meter name is automatically inferred.
+      meter_names: []
+    # calculate top-k meter on single target multiple ouput setting
+    recall_at_k_list_meter:
+      # number of recall meters. In cases like linear evaluation of feature, we perform
       # evaluation of several layers and there's a separate meter for each layer.
       # num_meters basically specifices number of meters.
       num_meters: 1
@@ -445,7 +486,6 @@ config:
       # names of the meter. Useful in cases where we have several meters. For the linear
       # feature evaluation workflows, meter name is automatically inferred.
       meter_names: []
-
   # ----------------------------------------------------------------------------------- #
   # MACHINE (cpu, gpu)
   # ----------------------------------------------------------------------------------- #
@@ -456,6 +496,8 @@ config:
   # MODEL
   # ----------------------------------------------------------------------------------- #
   MODEL:
+    # default model. User can define their own model and use that instead.
+    BASE_MODEL_NAME: multi_input_output_model
     # sometimes we can avoid CUDA OOM issues by clearing out the cache. Clearing out cache
     # is slow so chose wisely.
     CUDA_CACHE:
@@ -742,8 +784,8 @@ config:
     # ----------------------------------------------------------------------------------- #
     AMP_PARAMS:
       USE_AMP: False
-      # Use O1 as it is robust and stable than O3. If you want to use O3, we recommend
-      # the following setting:
+      # Only applicable for Apex AMP_TYPE.
+      # Use O1 as it is robust and stable than O3. If you want to use O3, we recommend the following setting:
       # {"opt_level": "O3", "keep_batchnorm_fp32": True, "master_weights": True, "loss_scale": "dynamic"}
       AMP_ARGS: {"opt_level": "O1"}
       # we support pytorch amp as well which is availale in pytorch>=1.6.

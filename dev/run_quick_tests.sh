@@ -19,6 +19,7 @@ TEST_LIST=(
     "test_larc_fsdp.py"
     "test_layer_memory_tracking.py"
     "test_losses_gpu.py"
+    "test_model_helpers.py"
     "test_regnet_fsdp.py"
     "test_regnet_fsdp_integration.py"
     "test_state_checkpoint_conversion.py"
@@ -43,36 +44,4 @@ popd
 # - verify that the associated jobs run to the end
 # -----------------------------------------------------------------------------
 
-CFG_LIST=(
-    "test/integration_test/quick_barlow_twins"
-    "test/integration_test/quick_deepcluster_v2"
-    "test/integration_test/quick_pirl"
-    "test/integration_test/quick_simclr"
-    "test/integration_test/quick_simclr_efficientnet"
-    "test/integration_test/quick_simclr_multicrop"
-    "test/integration_test/quick_simclr_regnet"
-    "test/integration_test/quick_swav"
-)
-
-echo "========================================================================"
-echo "Configs to run:"
-echo "${CFG_LIST[@]}"
-echo "========================================================================"
-
-BINARY="python ${SRC_DIR}/tools/run_distributed_engines.py"
-
-for cfg in "${CFG_LIST[@]}"; do
-    echo "========================================================================"
-    echo "Running $cfg ..."
-    echo "========================================================================"
-    CHECKPOINT_DIR=$(mktemp -d)
-    # shellcheck disable=SC2102
-    # shellcheck disable=SC2086
-    CUDA_LAUNCH_BLOCKING=1 $BINARY config=$cfg \
-        config.DATA.TRAIN.DATA_SOURCES=[synthetic] \
-        hydra.verbose=true \
-        config.HOOKS.TENSORBOARD_SETUP.USE_TENSORBOARD=true \
-        config.CHECKPOINT.DIR="$CHECKPOINT_DIR" && echo "TEST OK" || exit
-
-    rm -rf $CHECKPOINT_DIR
-done
+bash "${SRC_DIR}/dev/run_quick_integration_tests.sh"
