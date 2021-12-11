@@ -5,9 +5,11 @@
 
 import logging
 
-from iopath.common.file_io import g_pathmgr
+import cv2
 from PIL import Image
+from iopath.common.file_io import g_pathmgr
 from torchvision.datasets import ImageFolder
+
 from vissl.data.data_helper import QueueDataset, get_mean_image
 from vissl.utils.io import load_file
 
@@ -113,6 +115,22 @@ class DiskImageDataset(QueueDataset):
             return img_path.replace(replace_prefix, new_prefix)
         return img_path
 
+    tonemap = cv2.createTonemapDrago(2.2)
+    scale = 1
+
+    @classmethod
+    def _load_image_in_disk_filelist(cls, img_path: str) -> Image.Image:
+        """Extended version of loading image that can deal with hdr images"""
+        if img_path.lower().endswith('hdr'):
+            hdr = cv2.imread(img_path, flags=cv2.IMREAD_ANYDEPTH)
+            # Tone-mapping and color space conversion
+            ldr = cls.scale * cls.tonemap.process(hdr)
+            # Remap to 0-255 for the bit-depth conversion
+            return Image.fromarray((ldr * 255).astype('uint8'))
+
+        with g_pathmgr.open(img_path, "rb") as fopen:
+            return Image.open(fopen).convert("RGB")
+
     def __len__(self):
         """
         Size of the dataset
@@ -144,8 +162,7 @@ class DiskImageDataset(QueueDataset):
                     replace_prefix=self._remove_prefix,
                     new_prefix=self._new_prefix,
                 )
-                with g_pathmgr.open(image_path, "rb") as fopen:
-                    img = Image.open(fopen).convert("RGB")
+                img = self._load_image_in_disk_filelist(image_path)
             elif self.data_source == "disk_folder":
                 img = self.image_dataset[idx][0]
             if is_success and self.enable_queue_dataset:
