@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import time
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -20,7 +21,6 @@ from classy_vision.generic.distributed_util import (
     set_cpu_device,
     set_cuda_device_index,
 )
-from classy_vision.generic.util import copy_model_to_gpu
 from classy_vision.hooks.classy_hook import ClassyHook
 from classy_vision.tasks import TASK_REGISTRY, ClassyTask
 from vissl.config import AttrDict
@@ -354,7 +354,7 @@ class SelfSupervisionTrainer(object):
         self.task.prepare_extraction(pin_memory=self.cfg.DATA.PIN_MEMORY)
 
         # Create distributed model
-        self._add_dummy_layer()
+        self.task.add_dummy_layer()
         self.task.init_distributed_data_parallel_model()
         if is_primary():
             logging.info(f"Model is:\n {self.task.model}")
@@ -434,6 +434,13 @@ class SelfSupervisionTrainer(object):
                 meter, "get_predictions"
             ), f"Meter {meter.name} doesn't implement get_predictions function"
 
+        dataset = task.datasets[split_name.lower()]
+        all_image_paths = dataset.get_image_paths()
+        assert (
+            len(all_image_paths) == 1
+        ), "Multi-dataset not supported yet for label predictions."
+        all_image_paths = all_image_paths[0]
+
         for count in itertools.count(start=0, step=1):
             try:
                 if count % 100 == 0:
@@ -447,7 +454,15 @@ class SelfSupervisionTrainer(object):
                     "inds": torch.cat(sample["data_idx"]).cpu().numpy(),
                 }
                 with torch.no_grad():
+                    # Send the input sample to the model, tracking also the
+                    # last batch for the hooks to refer to
+                    task.last_batch = SimpleNamespace()
                     model_output = task.model(input_sample["input"])
+                    task.last_batch.sample = input_sample
+                    task.last_batch.model_output = model_output
+
+                    # Run hooks on forward pass
+                    task.run_hooks(SSLClassyHookFunctions.on_forward.name)
 
                     # get the model predictions using the meter
                     if isinstance(model_output, list):
@@ -482,6 +497,7 @@ class SelfSupervisionTrainer(object):
         self._sync_and_print_meters(task)
         # save the predictions, targets and image indices now
         self._save_extracted_label_predictions(
+            all_image_paths=all_image_paths,
             predictions=out_predictions,
             confidence_scores=out_scores,
             targets=out_targets,
@@ -492,9 +508,10 @@ class SelfSupervisionTrainer(object):
 
     @staticmethod
     def _save_extracted_label_predictions(
-        predictions,
-        confidence_scores,
-        targets,
+        all_image_paths: List[str],
+        predictions: Dict[str, Dict[int, Any]],
+        confidence_scores: Dict[str, Dict[str, Any]],
+        targets: Dict[str, Dict[int, Any]],
         dist_rank: int,
         split: str,
         output_folder: str,
@@ -508,12 +525,15 @@ class SelfSupervisionTrainer(object):
             )
             preds = np.array(torch.stack(list(predictions[layer_name].values())))
             scores = np.array(torch.stack(list(confidence_scores[layer_name].values())))
+            indices = np.array(list(predictions[layer_name].keys()))
+            image_paths = np.array([all_image_paths[i] for i in indices])
             N = preds.shape[0]
             output[layer_name] = {
                 "predictions": preds.reshape(N, -1),
                 "confidence_scores": scores.reshape(N, -1),
                 "targets": np.array(list(targets[layer_name].values())),
-                "inds": np.array(list(predictions[layer_name].keys())),
+                "inds": indices,
+                "image_paths": image_paths,
             }
 
         split = split.lower()
@@ -530,18 +550,23 @@ class SelfSupervisionTrainer(object):
             out_inds_file = (
                 f"{output_folder}/rank{dist_rank}_{split}_{layer_name}_inds.npy"
             )
+            out_images_file = (
+                f"{output_folder}/rank{dist_rank}_{split}_{layer_name}_images.npy"
+            )
 
             logging.info(
                 f"For {layer_name}, "
                 f"saving predictions: {layer_prediction['predictions'].shape}, "
                 f"saving scores: {layer_prediction['confidence_scores'].shape}, "
                 f"targets: {layer_prediction['targets'].shape}, "
-                f"inds: {layer_prediction['inds'].shape}"
+                f"inds: {layer_prediction['inds'].shape}, "
+                f"images: {layer_prediction['image_paths'].shape}"
             )
             save_file(layer_prediction["predictions"], out_pred_file)
             save_file(layer_prediction["confidence_scores"], out_scores_file)
             save_file(layer_prediction["targets"], out_target_file)
             save_file(layer_prediction["inds"], out_inds_file)
+            save_file(layer_prediction["image_paths"], out_images_file)
 
     def _sync_and_print_meters(self, task):
         for meter in task.meters:
@@ -677,20 +702,6 @@ class SelfSupervisionTrainer(object):
                 )
                 break
 
-    def _add_dummy_layer(self):
-        """
-        In case of feature evaluation mode, if we are freezing both trunk and
-        head, DDP won't work as there are no parameters in the model. Adding
-        the dummy head will lead to features being not right. So we rather
-        add the dummy layer to the model and use DDP. We copy the model to
-        gpu (if using gpus) after the new dummy layer addition.
-        """
-        fully_frozen_model = self.task.base_model.is_fully_frozen_model()
-        if fully_frozen_model:
-            self.task.base_model.dummy_layer = torch.nn.Linear(4, 4)
-            if self.task.device.type == "cuda":
-                self.task.base_model = copy_model_to_gpu(self.task.base_model)
-
     def _cleanup_task(self):
         if hasattr(self.task, "data_iterator"):
             del self.task.data_iterator
@@ -717,7 +728,7 @@ class SelfSupervisionTrainer(object):
         assert self.task.base_model.is_clustering_model(), error_message
 
         # Create distributed model
-        self._add_dummy_layer()
+        self.task.add_dummy_layer()
         self.task.init_distributed_data_parallel_model()
         if is_primary():
             logging.info("Model is:\n {}".format(self.task.model))
