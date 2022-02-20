@@ -196,7 +196,8 @@ class GenericSSLDataset(VisslDatasetBase):
             class_idx_file_path = (
                 f"{checkpoint_folder}/{split.lower()}_label_to_index_map.json"
             )
-            save_file(cls_idx_map, class_idx_file_path)
+            if not g_pathmgr.exists(class_idx_file_path):
+                save_file(cls_idx_map, class_idx_file_path, append_to_json=False)
 
     def _convert_to_numeric_ids(self, labels: np.ndarray) -> np.ndarray:
         """
@@ -407,7 +408,15 @@ class GenericSSLDataset(VisslDatasetBase):
             if not getattr(source, "get_image_paths", 0):
                 msg = f"Cannot retrieve image paths for source {self.data_sources[i]}"
                 raise ValueError(msg)
-            image_paths.append(source.get_image_paths())
+
+            data_obj_paths = source.get_image_paths()
+            if self.data_limit >= 0 and self._can_random_subset_data_sources():
+                if not self._subset_initialized:
+                    self._init_image_and_label_subset()
+                data_obj_paths = [
+                    data_obj_paths[idx] for idx in self.image_and_label_subset
+                ]
+            image_paths.append(data_obj_paths)
         return image_paths
 
     def get_available_splits(self, dataset_config):
