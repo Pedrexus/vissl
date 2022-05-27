@@ -3,14 +3,16 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from enum import Enum, auto
+from enum import auto, Enum
 from typing import List
 
 from classy_vision.hooks.classy_hook import ClassyHook
 from vissl.config import AttrDict
 from vissl.hooks.deepclusterv2_hooks import ClusterMemoryHook, InitMemoryHook  # noqa
 from vissl.hooks.dino_hooks import DINOHook
+from vissl.hooks.ema_hooks import EmaHook
 from vissl.hooks.grad_clip_hooks import GradClipHook  # noqa
+from vissl.hooks.ibot_hooks import IBOTHook
 from vissl.hooks.log_hooks import (  # noqa
     DumpMemoryOnException,
     LogGpuMemoryHook,
@@ -21,7 +23,7 @@ from vissl.hooks.log_hooks import (  # noqa
 )
 from vissl.hooks.moco_hooks import MoCoHook  # noqa
 from vissl.hooks.model_output_mask_hook import ModelOutputMaskHook
-from vissl.hooks.profiling_hook import ProfilingHook
+from vissl.hooks.profiling_hook import CudaSynchronizeHook, ProfilingHook
 from vissl.hooks.state_update_hooks import (  # noqa
     CheckNanLossHook,
     CheckNanModelOutputHook,
@@ -29,8 +31,10 @@ from vissl.hooks.state_update_hooks import (  # noqa
     SetDataSamplerEpochHook,
     SSLModelComplexityHook,
 )
-from vissl.hooks.swav_hooks import NormalizePrototypesHook  # noqa
-from vissl.hooks.swav_hooks import SwAVUpdateQueueScoresHook  # noqa
+from vissl.hooks.swav_hooks import (  # noqa  # noqa
+    NormalizePrototypesHook,
+    SwAVUpdateQueueScoresHook,
+)
 from vissl.hooks.swav_momentum_hooks import (
     SwAVMomentumHook,
     SwAVMomentumNormalizePrototypesHook,
@@ -73,6 +77,8 @@ def add_loss_hooks(hooks, loss_cfg, cfg):
         )
     if cfg.LOSS.name == "dino_loss":
         hooks.append(DINOHook())
+    if cfg.LOSS.name in {"ibot_loss"}:
+        hooks.append(IBOTHook())
     if cfg.LOSS.name == "deepclusterv2_loss":
         hooks.extend([InitMemoryHook(), ClusterMemoryHook()])
     if cfg.LOSS.name == "moco_loss":
@@ -150,6 +156,9 @@ def default_hook_generator(cfg: AttrDict) -> List[ClassyHook]:
         else None
     )
 
+    if CudaSynchronizeHook.is_enabled(cfg.MODEL):
+        hooks.append(CudaSynchronizeHook())
+
     if ProfilingHook.is_enabled(cfg.PROFILING):
         hooks.append(ProfilingHook(profiling_config=cfg.PROFILING))
 
@@ -169,6 +178,17 @@ def default_hook_generator(cfg: AttrDict) -> List[ClassyHook]:
         hooks.extend([ModelOutputMaskHook()])
 
     if cfg.HOOKS.CHECK_NAN:
-        hooks.extend([CheckNanLossHook(), CheckNanModelOutputHook()])
+        hooks.extend([CheckNanLossHook(), CheckNanModelOutputHook(world_size)])
+
+    if cfg.HOOKS.EMA_MODEL.ENABLE_EMA_METERS or cfg.HOOKS.EMA_MODEL.SAVE_EMA_MODEL:
+        hooks.extend(
+            [
+                EmaHook(
+                    enable_ema_meters=cfg.HOOKS.EMA_MODEL.ENABLE_EMA_METERS,
+                    update_iter=cfg.HOOKS.EMA_MODEL.UPDATE_ITER,
+                    warmup=cfg.HOOKS.EMA_MODEL.WARMUP,
+                )
+            ]
+        )
 
     return hooks

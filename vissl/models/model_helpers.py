@@ -51,6 +51,19 @@ def transform_model_input_data_type(model_input, input_type: str):
     return model_output
 
 
+def model_output_has_nan(model_output) -> bool:
+    """
+    Model output can be:
+    - a tensor
+    - list of tensors
+    - list of list of tensors
+    """
+    if isinstance(model_output, list):
+        return any(model_output_has_nan(x) for x in model_output)
+    else:
+        return not torch.isfinite(model_output).all()
+
+
 def is_feature_extractor_model(model_config):
     """
     If the model is a feature extractor model:
@@ -60,7 +73,10 @@ def is_feature_extractor_model(model_config):
     """
     return (
         model_config.FEATURE_EVAL_SETTINGS.EVAL_MODE_ON
-        and model_config.FEATURE_EVAL_SETTINGS.FREEZE_TRUNK_ONLY
+        and (
+            model_config.FEATURE_EVAL_SETTINGS.FREEZE_TRUNK_ONLY
+            or model_config.FEATURE_EVAL_SETTINGS.FREEZE_TRUNK_AND_HEAD
+        )
         and len(model_config.FEATURE_EVAL_SETTINGS.LINEAR_EVAL_FEAT_POOL_OPS_MAP) > 0
     )
 
@@ -318,6 +334,24 @@ def parse_out_keys_arg(
     max_out_feat = max(all_feat_names.index(key) for key in out_feat_keys)
 
     return out_feat_keys, max_out_feat
+
+
+def rearrange(x: torch.Tensor, pattern: str) -> torch.Tensor:
+    """
+    Rearranges a tensor by permuting its inputs based on a pattern
+    provided as input
+
+    Example:
+
+        rearrange(torch.randn(size=(2, 3, 4, 5, 6)), 'n d h w c -> n c d h w').shape
+        > torch.Size([2, 6, 3, 4, 5])
+    """
+    before, after = pattern.split("->")
+    before = before.strip().split(" ")
+    after = after.strip().split(" ")
+    after = [before.index(a) for a in after]
+    assert len(after) == len(before)
+    return x.permute(after)
 
 
 def get_trunk_forward_outputs_module_list(
@@ -645,6 +679,9 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
+
+    def extra_repr(self) -> str:
+        return "p={}".format(self.drop_prob)
 
 
 to_1tuple = _ntuple(1)

@@ -13,9 +13,14 @@ SRC_DIR=$(dirname "${SRC_DIR}")
 # -----------------------------------------------------------------------------
 
 TEST_LIST=(
+    "test_dino_deit.py"
+    "test_dino_deit_fsdp.py"
+    "test_dino_xcit.py"
+    "test_dino_xcit_fsdp.py"
     "test_extract_cluster.py"
     "test_extract_features.py"
     "test_finetuning.py"
+    "test_ibot.py"
     "test_larc_fsdp.py"
     "test_layer_memory_tracking.py"
     "test_losses_gpu.py"
@@ -24,6 +29,7 @@ TEST_LIST=(
     "test_regnet_fsdp_integration.py"
     "test_state_checkpoint_conversion.py"
     "test_state_checkpointing.py"
+    "test_vit_fsdp.py"
 )
 
 echo "========================================================================"

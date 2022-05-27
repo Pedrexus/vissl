@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from vissl.config import AttrDict
 from vissl.models.heads import register_model_head
-from vissl.utils.fsdp_utils import fsdp_wrapper
+from vissl.utils.fsdp_utils import fsdp_auto_wrap_bn, fsdp_wrapper
 
 
 @register_model_head("swav_head")
@@ -40,6 +40,7 @@ class SwAVPrototypesHead(nn.Module):
         normalize_feats: bool = True,
         activation_name: str = "ReLU",
         use_weight_norm_prototypes: bool = False,
+        normalize_last_layer: bool = False,
     ):
         """
         Args:
@@ -63,7 +64,8 @@ class SwAVPrototypesHead(nn.Module):
 
                         This could be particularly useful when performing full finetuning on
                         hidden layers.
-            use_weight_norm_prototypes (bool): whether to use weight norm module for the prototypes layers.
+            use_weight_norm_prototypes (bool): whether to use weight norm module for the
+            prototypes layers.
         """
 
         super().__init__()
@@ -99,6 +101,8 @@ class SwAVPrototypesHead(nn.Module):
                     proto = nn.utils.weight_norm(proto)
                     proto.weight_g.data.fill_(1)
                 self.add_module("prototypes" + str(i), proto)
+                if normalize_last_layer:
+                    proto.weight_g.requires_grad = False
         else:
             self.nmb_heads = 0
         self.return_embeddings = return_embeddings
@@ -154,15 +158,16 @@ def SwavPrototypesHeadFSDP(
         skip_last_bn=skip_last_bn,
         normalize_feats=normalize_feats,
     )
+    head = fsdp_auto_wrap_bn(head)
 
-    fp32_fsdp_config = model_config.FSDP_CONFIG.copy()
-    fp32_fsdp_config["flatten_parameters"] = False
-    fp32_fsdp_config["mixed_precision"] = False
-    fp32_fsdp_config["fp32_reduce_scatter"] = False
-    fp32_fsdp_config["compute_dtype"] = torch.float32
-
+    prototypes_fp32_fsdp_config = model_config.FSDP_CONFIG.copy()
+    prototypes_fp32_fsdp_config["flatten_parameters"] = False
+    prototypes_fp32_fsdp_config["mixed_precision"] = False
+    prototypes_fp32_fsdp_config["fp32_reduce_scatter"] = False
+    prototypes_fp32_fsdp_config["compute_dtype"] = torch.float32
     for j in range(head.nmb_heads):
         module = getattr(head, "prototypes" + str(j))
-        module = fsdp_wrapper(module, **fp32_fsdp_config)
+        module = fsdp_wrapper(module, **prototypes_fp32_fsdp_config)
         setattr(head, "prototypes" + str(j), module)
+
     return fsdp_wrapper(head, **model_config.FSDP_CONFIG)

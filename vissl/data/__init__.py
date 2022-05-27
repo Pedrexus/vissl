@@ -18,9 +18,9 @@ from vissl.data.data_helper import (
 )
 from vissl.data.dataloader_sync_gpu_wrapper import DataloaderSyncGPUWrapper
 from vissl.data.dataset_catalog import (
-    VisslDatasetCatalog,
     get_data_files,
     register_datasets,
+    VisslDatasetCatalog,
 )
 from vissl.data.disk_dataset import DiskImageDataset
 from vissl.data.ssl_dataset import GenericSSLDataset
@@ -41,6 +41,7 @@ DATASET_SOURCE_MAP = {
     "airstore": AirstoreDataset,
     "disk_filelist": DiskImageDataset,
     "disk_folder": DiskImageDataset,
+    "disk_roi_annotations": DiskImageDataset,
     "torchvision_dataset": TorchvisionDataset,
     "synthetic": SyntheticImageDataset,
 }
@@ -49,6 +50,7 @@ DATASET_SOURCE_MAP = {
 DATA_SOURCES_WITH_SUBSET_SUPPORT = {
     "disk_filelist",
     "disk_folder",
+    "disk_roi_annotations",
     "torchvision_dataset",
     "synthetic",
 }
@@ -185,6 +187,11 @@ def build_dataloader(
     # Replace the worker_init_fn with a deterministic one when debugging
     if dataset_config["USE_DEBUGGING_SAMPLER"]:
         worker_init_fn = debugging_worker_init_fn
+
+    # Load the labels of the dataset before creating the data loader
+    # or else the load of files will happen on each data loader separately
+    # decreasing performance / hitting quota on data source
+    dataset.load_labels()
 
     # Create the pytorch dataloader
     dataloader = DataLoader(

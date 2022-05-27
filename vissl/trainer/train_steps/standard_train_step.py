@@ -20,7 +20,8 @@ from vissl.utils.activation_checkpointing import (
     manual_gradient_all_reduce,
     manual_sync_params,
 )
-from vissl.utils.misc import is_apex_available
+from vissl.utils.fsdp_utils import is_fsdp_model
+from vissl.utils.misc import is_apex_available, torch_version
 from vissl.utils.perf_stats import PerfTimer
 from vissl.utils.profiler import record_function
 
@@ -34,7 +35,7 @@ if is_apex_available():
 LastBatchInfo = SimpleNamespace
 
 
-def construct_sample_for_model(batch_data, task):
+def construct_sample_for_model(batch_data: dict, sample_key_names: dict):
     """
     Given the input batch from the dataloader, verify the input is
     as expected: the input data and target data is present in the
@@ -43,7 +44,6 @@ def construct_sample_for_model(batch_data, task):
     is in right format i.e. the multiple input should be nested
     under a common key "input".
     """
-    sample_key_names = task.data_and_label_keys
     inp_key, target_key = sample_key_names["input"], sample_key_names["target"]
     all_keys = inp_key + target_key
 
@@ -57,7 +57,7 @@ def construct_sample_for_model(batch_data, task):
         assert isinstance(batch_data[key], list), f"key: {key} input is not a list"
         assert (
             len(batch_data[key]) == 1
-        ), "Please modify your train step to handle multi-modal input"
+        ), f"Please modify your train step to handle multi-modal input: key {key}"
 
     # single input case
     if len(sample_key_names["input"]) == 1 and len(sample_key_names["target"]) == 1:
@@ -81,9 +81,10 @@ def construct_sample_for_model(batch_data, task):
             sample["target"] = batch_data[target_key[0]][0]
         sample["data_valid"] = batch_data["data_valid"][0]
 
-    # copy the other keys as-is, method dependent
+    # Copy the other keys as-is, method dependent
+    # - But avoid to erase the standard keys
     for k in batch_data.keys():
-        if k not in all_keys:
+        if k not in all_keys and k not in sample:
             sample[k] = batch_data[k]
 
     return sample
@@ -119,7 +120,7 @@ def standard_train_step(task):
     with PerfTimer("read_sample", perf_stats):
         sample = next(task.data_iterator)
 
-    sample = construct_sample_for_model(sample, task)
+    sample = construct_sample_for_model(sample, task.data_and_label_keys)
 
     # Only need gradients during training
     grad_context = torch.enable_grad() if task.train else torch.no_grad()
@@ -156,6 +157,22 @@ def standard_train_step(task):
         # Compute loss
         with PerfTimer("loss_compute", perf_stats), record_function("loss_compute"):
             local_loss = task.loss(model_output, target)
+
+        # For composite losses, log the sub-losses and extract the main loss
+        if isinstance(local_loss, dict):
+            for loss_key, loss_val in local_loss.items():
+                if loss_key == "loss":
+                    continue
+                # If provided with a tensor, we assume that this is a local value
+                # and perform the step to compute its mean accross workers
+                if isinstance(loss_val, torch.Tensor):
+                    loss_val = all_reduce_mean(loss_val.detach().clone()).item()
+                    task.additional_log_data[f"loss.{loss_key}"] = loss_val
+                # Else, if provided with a scalar, we assume it has already
+                # been computed appropriately
+                elif isinstance(loss_val, (int, float)):
+                    task.additional_log_data[f"loss.{loss_key}"] = loss_val
+            local_loss = local_loss["loss"]
 
         # Reduce the loss value across all nodes and gpus.
         with PerfTimer("loss_all_reduce", perf_stats):
@@ -225,6 +242,12 @@ def standard_train_step(task):
                 task.amp_grad_scaler.update()
             else:
                 task.optimizer.step(where=task.where)
+
+            # set the model grads to None to save memory
+            # only in case of FSDP model
+            if is_fsdp_model(task.model):
+                zero_grad(task.model)
+
         task.run_hooks(SSLClassyHookFunctions.on_update.name)
         task.num_updates += task.get_global_batchsize()
 
@@ -232,3 +255,11 @@ def standard_train_step(task):
     timer_train_step.record()
 
     return task
+
+
+def zero_grad(model: torch.nn.Module) -> None:
+    if torch_version() >= (1, 7, 0):
+        model.zero_grad(set_to_none=True)
+    else:
+        for p in model.parameters():
+            p.grad = None

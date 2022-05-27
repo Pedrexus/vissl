@@ -7,18 +7,20 @@
 Code modified from https://github.com/facebookresearch/xcit/blob/main/xcit.py # NOQA
 """
 
-import copy
 import logging
 import math
 from functools import partial
-from functools import partial
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from fairscale.nn import checkpoint_wrapper
 from vissl.config import AttrDict
 from vissl.models.model_helpers import DropPath, to_2tuple, trunc_normal_
 from vissl.models.trunks import register_model_trunk
 from vissl.models.trunks.vision_transformer import Mlp
+from vissl.utils.fsdp_utils import fsdp_wrapper
+from vissl.utils.misc import set_torch_seed
 
 
 class PositionalEncodingFourier(nn.Module):
@@ -67,7 +69,7 @@ def conv3x3(in_planes, out_planes, stride=1):
         nn.Conv2d(
             in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False
         ),
-        nn.SyncBatchNorm(out_planes),
+        nn.BatchNorm2d(out_planes),
     )
 
 
@@ -78,7 +80,11 @@ class ConvPatchEmbed(nn.Module):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        self.feat_map_size = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+        )
+        num_patches = self.feat_map_size[0] * self.feat_map_size[1]
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -103,19 +109,18 @@ class ConvPatchEmbed(nn.Module):
             )
 
     def forward(self, x, padding_size=None):
-        B, C, H, W = x.shape
         x = self.proj(x)
         Hp, Wp = x.shape[2], x.shape[3]
         x = x.flatten(2).transpose(1, 2)
-
         return x, (Hp, Wp)
 
 
 class LPI(nn.Module):
     """
-    Local Patch Interaction module that allows explicit communication between tokens in 3x3 windows
-    to augment the implicit communcation performed by the block diagonal scatter attention.
-    Implemented using 2 layers of separable 3x3 convolutions with GeLU and BatchNorm2d
+    Local Patch Interaction module that allows explicit communication between tokens in 3x3
+    windows to augment the implicit communcation performed by the block diagonal
+    scatter attention. Implemented using 2 layers of separable 3x3 convolutions with
+    GeLU and BatchNorm2d
     """
 
     def __init__(
@@ -140,7 +145,7 @@ class LPI(nn.Module):
             groups=out_features,
         )
         self.act = act_layer()
-        self.bn = nn.SyncBatchNorm(in_features)
+        self.bn = nn.BatchNorm2d(in_features)
         self.conv2 = torch.nn.Conv2d(
             in_features,
             out_features,
@@ -176,7 +181,7 @@ class ClassAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = qk_scale or head_dim**-0.5
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -250,7 +255,8 @@ class ClassAttentionBlock(nn.Module):
         else:
             self.gamma1, self.gamma2 = 1.0, 1.0
 
-        # FIXME: A hack for models pre-trained with layernorm over all the tokens not just the CLS
+        # FIXME: A hack for models pre-trained with layernorm over all the tokens not just
+        # the CLS
         self.tokens_norm = tokens_norm
 
     def forward(self, x, H, W, mask=None):
@@ -269,9 +275,9 @@ class ClassAttentionBlock(nn.Module):
 
 
 class XCA(nn.Module):
-    """Cross-Covariance Attention (XCA) operation where the channels are updated using a weighted
-     sum. The weights are obtained from the (softmax normalized) Cross-covariance
-    matrix (Q^T K \\in d_h \\times d_h)
+    """Cross-Covariance Attention (XCA) operation where the channels are updated using
+    a weighted sum. The weights are obtained from the (softmax normalized)
+    Cross-covariance matrix (Q^T K \\in d_h \\times d_h)
     """
 
     def __init__(
@@ -374,7 +380,6 @@ class XCABlock(nn.Module):
         return x
 
 
-@register_model_trunk("xcit")
 class XCiT(nn.Module):
     """
     Based on timm and DeiT code bases
@@ -386,82 +391,98 @@ class XCiT(nn.Module):
         super().__init__()
 
         assert model_config.INPUT_TYPE in ["rgb", "bgr"], "Input type not supported"
-        trunk_config = copy.deepcopy(model_config.TRUNK.XCIT)
+        trunk_config = model_config.TRUNK.XCIT
 
         logging.info("Building model: XCiT from yaml config")
-        # Hacky workaround
-        trunk_config = AttrDict({k.lower(): v for k, v in trunk_config.items()})
-        img_size = trunk_config.image_size
-        patch_size = trunk_config.patch_size
-        embed_dim = trunk_config.hidden_dim
-        depth = trunk_config.num_layers
-        num_heads = trunk_config.num_heads
-        mlp_ratio = 4.0
-        qkv_bias = trunk_config.qkv_bias
-        qk_scale = trunk_config.qk_scale
-        drop_rate = trunk_config.dropout_rate
-        attn_drop_rate = trunk_config.attention_dropout_rate
-        drop_path_rate = trunk_config.drop_path_rate
-        eta = trunk_config.eta
-        tokens_norm = trunk_config.tokens_norm
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
-        self.num_features = (
-            self.embed_dim
-        ) = embed_dim  # num_features for consistency with other models
+        self.model_config = model_config
+        self.trunk_config = trunk_config
+        self.img_size = trunk_config.IMAGE_SIZE
+        self.patch_size = trunk_config.PATCH_SIZE
+        self.embed_dim = trunk_config.HIDDEN_DIM
+        self.depth = trunk_config.NUM_LAYERS
+        self.num_heads = trunk_config.NUM_HEADS
+        self.mlp_ratio = trunk_config.MLP_RATIO
+        self.qkv_bias = trunk_config.QKV_BIAS
+        self.qk_scale = trunk_config.QK_SCALE
+        self.drop_rate = trunk_config.DROPOUT_RATE
+        self.attn_drop_rate = trunk_config.ATTENTION_DROPOUT_RATE
+        self.drop_path_rate = trunk_config.DROP_PATH_RATE
+        self.eta = trunk_config.ETA
+        self.tokens_norm = trunk_config.TOKENS_NORM
+
+        # num_features for consistency with other models
+        self.num_features = self.embed_dim
+
         self.patch_embed = ConvPatchEmbed(
-            img_size=img_size, embed_dim=embed_dim, patch_size=patch_size
+            img_size=self.img_size, embed_dim=self.embed_dim, patch_size=self.patch_size
         )
-        num_patches = self.patch_embed.num_patches
+        self.num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        dpr = [drop_path_rate for i in range(depth)]
-        self.blocks = nn.ModuleList(
-            [
-                XCABlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    drop_path=dpr[i],
-                    norm_layer=norm_layer,
-                    num_tokens=num_patches,
-                    eta=eta,
-                )
-                for i in range(depth)
-            ]
-        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_drop = nn.Dropout(p=self.drop_rate)
 
-        cls_attn_layers = 2
-        self.cls_attn_blocks = nn.ModuleList(
-            [
-                ClassAttentionBlock(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    norm_layer=norm_layer,
-                    eta=eta,
-                    tokens_norm=tokens_norm,
-                )
-                for i in range(cls_attn_layers)
-            ]
-        )
-        self.norm = norm_layer(embed_dim)
+        self.blocks = self._create_xca_blocks(norm_layer)
 
-        self.pos_embeder = PositionalEncodingFourier(dim=embed_dim)
+        self.cls_attn_blocks = self._create_cls_attn_blocks(norm_layer)
+        self.norm = norm_layer(self.embed_dim)
+
+        self.pos_embeder = PositionalEncodingFourier(dim=self.embed_dim)
         self.use_pos = True
 
-        # Classifier head
+        # Initialize weights
         trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
+        self.patch_embed.apply(self._init_weights)
+        self.pos_embeder.apply(self._init_weights)
+        self.norm.apply(self._init_weights)
+
+    def _create_xca_blocks(self, norm_layer):
+        return nn.ModuleList(
+            [self._create_xca_block(norm_layer, depth=i) for i in range(self.depth)]
+        )
+
+    def _create_xca_block(self, norm_layer, depth: int):
+        with set_torch_seed(self.model_config._MODEL_INIT_SEED + depth + 1):
+            block = XCABlock(
+                dim=self.embed_dim,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                qkv_bias=self.qkv_bias,
+                qk_scale=self.qk_scale,
+                drop=self.drop_rate,
+                attn_drop=self.attn_drop_rate,
+                drop_path=self.drop_path_rate,
+                norm_layer=norm_layer,
+                num_tokens=self.num_patches,
+                eta=self.eta,
+            )
+            block.apply(self._init_weights)
+            return block
+
+    def _create_cls_attn_blocks(self, norm_layer, depth: int = 2):
+        return nn.ModuleList(
+            [self._create_cls_attn_block(norm_layer, depth=i) for i in range(depth)]
+        )
+
+    def _create_cls_attn_block(self, norm_layer, depth: int):
+        with set_torch_seed(
+            self.model_config._MODEL_INIT_SEED + self.depth + depth + 1
+        ):
+            block = ClassAttentionBlock(
+                dim=self.embed_dim,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                qkv_bias=self.qkv_bias,
+                qk_scale=self.qk_scale,
+                drop=self.drop_rate,
+                attn_drop=self.attn_drop_rate,
+                norm_layer=norm_layer,
+                eta=self.eta,
+                tokens_norm=self.tokens_norm,
+            )
+            block.apply(self._init_weights)
+            return block
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -476,32 +497,120 @@ class XCiT(nn.Module):
     def no_weight_decay(self):
         return {"pos_embed", "cls_token", "dist_token"}
 
+    def _get_pos_encoding(self, B, Hp, Wp, x):
+        return self.pos_embeder(B, Hp, Wp).reshape(B, -1, x.shape[1]).permute(0, 2, 1)
+
+    def _add_class_token(self, x):
+        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
+        return torch.cat((cls_tokens, x), dim=1)
+
     def forward_features(self, x):
-        B, C, H, W = x.shape
+        B = x.shape[0]
 
+        # Patch embedding
         x, (Hp, Wp) = self.patch_embed(x)
-
         if self.use_pos:
-            pos_encoding = (
-                self.pos_embeder(B, Hp, Wp).reshape(B, -1, x.shape[1]).permute(0, 2, 1)
-            )
+            pos_encoding = self._get_pos_encoding(B, Hp, Wp, x)
             x = x + pos_encoding
-
         x = self.pos_drop(x)
 
+        # Go through the XCA blocks
         for blk in self.blocks:
             x = blk(x, Hp, Wp)
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
+        # Add the class token and go through the class attention blocks
+        x = self._add_class_token(x)
         for blk in self.cls_attn_blocks:
             x = blk(x, Hp, Wp)
 
+        # Select the class token and returns it
         x = self.norm(x)[:, 0]
         return x
 
-    def forward(self, x, out_feat_keys=None):
-        x = self.forward_features(x)
-        x = x.unsqueeze(0)
-        return x
+    def get_intermediate_features(
+        self, x: torch.Tensor, names: List[str]
+    ) -> List[torch.Tensor]:
+        """
+        Given a list of feature names, return a list of the same length
+        where each output correspond to the desired feature.
+
+        The available features are:
+        - lastCLS => CLS token of last block
+        - lastMAP => feature map of the last block
+        """
+        B = x.shape[0]
+
+        # Patch embedding
+        x, (Hp, Wp) = self.patch_embed(x)
+        if self.use_pos:
+            pos_encoding = self._get_pos_encoding(B, Hp, Wp, x)
+            x = x + pos_encoding
+        x = self.pos_drop(x)
+
+        # Go through the XCA blocks
+        for blk in self.blocks:
+            x = blk(x, Hp, Wp)
+
+        # Add the class token and go through the class attention blocks
+        x = self._add_class_token(x)
+        for blk in self.cls_attn_blocks:
+            x = blk(x, Hp, Wp)
+
+        # Select the features we are interested in and returns them
+        output = []
+        for name in names:
+            if name == "lastCLS":
+                output.append(self.norm(x)[:, 0])
+            elif name == "lastMAP":
+                feat_map_size = self.patch_embed.feat_map_size
+                feat_map = self.norm(x)[:, 1:]
+                B, L, C = feat_map.shape
+                feat_map = feat_map.reshape((B, *feat_map_size, C))
+                output.append(feat_map)
+        return output
+
+    def forward(self, x, out_feat_keys: Optional[List[str]] = None):
+        if out_feat_keys is None or len(out_feat_keys) == 0:
+            x = self.forward_features(x)
+            return [x]
+        else:
+            return self.get_intermediate_features(x, out_feat_keys)
+
+
+class XCiT_FSDP(XCiT):
+    """
+    XCiT where blocks are wrapped by FSDP
+    """
+
+    def _create_xca_blocks(self, norm_layer):
+        blocks = []
+        for i in range(self.depth):
+            block = self._create_xca_block(norm_layer, depth=i)
+            if self.trunk_config.CHECKPOINT_XCA_BLOCK:
+                block = checkpoint_wrapper(block)
+            block = fsdp_wrapper(block, **self.model_config.FSDP_CONFIG)
+            blocks.append(block)
+        return nn.ModuleList(blocks)
+
+    def _create_cls_attn_blocks(self, norm_layer, depth: int = 2):
+        blocks = []
+        for i in range(self.depth):
+            block = self._create_cls_attn_block(norm_layer, depth=i)
+            if self.trunk_config.CHECKPOINT_ATTN_BLOCK:
+                block = checkpoint_wrapper(block)
+            block = fsdp_wrapper(block, **self.model_config.FSDP_CONFIG)
+            blocks.append(block)
+        return nn.ModuleList(blocks)
+
+
+@register_model_trunk("xcit")
+def create_XCiT_DDP(model_config: AttrDict, model_name: str):
+    with set_torch_seed(model_config._MODEL_INIT_SEED):
+        return XCiT(model_config, model_name)
+
+
+@register_model_trunk("xcit_fsdp")
+def create_XCiT_FSDP(model_config: AttrDict, model_name: str):
+    with set_torch_seed(model_config._MODEL_INIT_SEED):
+        xcit = XCiT_FSDP(model_config, model_name)
+        return fsdp_wrapper(xcit, **model_config.FSDP_CONFIG)

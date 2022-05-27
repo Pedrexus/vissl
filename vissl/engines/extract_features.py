@@ -12,6 +12,8 @@ from classy_vision.hooks import ClassyHook
 from vissl.config import AttrDict
 from vissl.engines.engine_registry import Engine, register_engine
 from vissl.hooks import default_hook_generator
+from vissl.hooks.profiling_hook import CudaSynchronizeHook
+from vissl.models.model_helpers import get_trunk_output_feature_names
 from vissl.trainer import SelfSupervisionTrainer
 from vissl.utils.collect_env import collect_env_info
 from vissl.utils.env import (
@@ -19,6 +21,7 @@ from vissl.utils.env import (
     print_system_env_info,
     set_env_vars,
 )
+from vissl.utils.extract_features_utils import ExtractedFeaturesLoader
 from vissl.utils.hydra_config import print_cfg
 from vissl.utils.logger import setup_logging, shutdown_logging
 from vissl.utils.misc import set_seeds, setup_multiprocessing_method
@@ -36,12 +39,12 @@ class ExtractFeatureEngine(Engine):
         node_id: int = 0,
         hook_generator: Callable[[Any], List[ClassyHook]] = default_hook_generator,
     ):
-        extract_main(
+        extract_features_main(
             cfg, dist_run_id, checkpoint_folder, local_rank=local_rank, node_id=node_id
         )
 
 
-def extract_main(
+def extract_features_main(
     cfg: AttrDict,
     dist_run_id: str,
     checkpoint_folder: str,
@@ -102,9 +105,47 @@ def extract_main(
         print_cfg(cfg)
         logging.info("System config:\n{}".format(collect_env_info()))
 
-    trainer = SelfSupervisionTrainer(cfg, dist_run_id)
-    trainer.extract(output_folder=cfg.EXTRACT_FEATURES.OUTPUT_DIR or checkpoint_folder)
+    # Identify the hooks to run for the extract label engine
+    # TODO - we need to plug this better with the engine registry
+    #  - we either need to use the global hooks registry
+    #  - or we need to create specific hook registry by engine
+    hooks = extract_features_hook_generator(cfg)
+
+    # Run the label prediction extraction
+    trainer = SelfSupervisionTrainer(cfg, dist_run_id, hooks=hooks)
+    output_dir = cfg.EXTRACT_FEATURES.OUTPUT_DIR or checkpoint_folder
+    trainer.extract(
+        output_folder=cfg.EXTRACT_FEATURES.OUTPUT_DIR or checkpoint_folder,
+        extract_features=True,
+        extract_predictions=False,
+    )
+
+    # TODO (prigoyal): merge this function with _extract_features
+    if dist_rank == 0 and cfg.EXTRACT_FEATURES.MAP_FEATURES_TO_IMG_NAME:
+        # Get the names of the features that we extracted features for. If user doesn't
+        # specify the features to evaluate, we get the full model output and freeze
+        # head/trunk both as caution.
+        layers = get_trunk_output_feature_names(cfg.MODEL)
+        if len(layers) == 0:
+            layers = ["heads"]
+        available_splits = [item.lower() for item in trainer.task.available_splits]
+        for split in available_splits:
+            image_paths = trainer.task.datasets[split].get_image_paths()[0]
+            for layer in layers:
+                ExtractedFeaturesLoader.map_features_to_img_filepath(
+                    image_paths=image_paths,
+                    input_dir=output_dir,
+                    split=split,
+                    layer=layer,
+                )
 
     logging.info("All Done!")
     # close the logging streams including the filehandlers
     shutdown_logging()
+
+
+def extract_features_hook_generator(cfg: AttrDict) -> List[ClassyHook]:
+    hooks = []
+    if cfg.MODEL.FSDP_CONFIG.FORCE_SYNC_CUDA:
+        hooks.append(CudaSynchronizeHook())
+    return hooks

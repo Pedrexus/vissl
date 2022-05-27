@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 import pprint
 import re
 import sys
@@ -55,7 +56,7 @@ def convert_to_attrdict(
 
     # assert the config and infer
     config = cfg.config
-    infer_and_assert_hydra_config(config)
+    infer_and_assert_hydra_config(config, cfg.engine_name)
     if dump_config:
         save_attrdict_to_disk(config)
     convert_fsdp_dtypes(config)
@@ -116,9 +117,9 @@ def compose_hydra_configuration(overrides: List[str]):
     # Backward compatibility with previous hydra versions:
     # In Hydra 1.1 and above, the compose API is not experimental anymore
     if get_hydra_version() >= (1, 1, 0):
-        from hydra import initialize_config_module, compose
+        from hydra import compose, initialize_config_module
     else:
-        from hydra.experimental import initialize_config_module, compose
+        from hydra.experimental import compose, initialize_config_module
 
     # Compose the overrides with "vissl/config/defaults.yaml"
     with initialize_config_module(config_module="vissl.config"):
@@ -293,7 +294,7 @@ def infer_learning_rate(cfg):
 
         scale_factor = float(batch_size) / base_lr_batch_size
         if scaling_type == "sqrt":
-            scale_factor = scale_factor ** 0.5
+            scale_factor = math.pow(scale_factor, 0.5)
         scaled_lr = base_lr * scale_factor
         cfg.OPTIMIZER.param_schedulers.lr = get_scaled_lr_scheduler(
             cfg, param_schedulers, scaled_lr
@@ -324,7 +325,7 @@ def infer_learning_rate(cfg):
 
         scale_factor = float(batch_size) / base_lr_batch_size
         if scaling_type == "sqrt":
-            scale_factor = scale_factor ** 0.5
+            scale_factor = math.pow(scale_factor, 0.5)
         scaled_lr = base_lr * scale_factor
         cfg.OPTIMIZER.param_schedulers.lr_head = get_scaled_lr_scheduler(
             cfg, param_schedulers, scaled_lr
@@ -351,14 +352,12 @@ def infer_losses_config(cfg):
     training in case user forgets to adjust all the parameters.
     """
     train_transforms = cfg.DATA.TRAIN.TRANSFORMS
-    total_num_crops = next(
-        (
-            transform["total_num_crops"]
-            for transform in train_transforms
-            if "total_num_crops" in transform
-        ),
-        None,
-    )
+    total_num_crops = None
+    multicrop_crops = []
+    for transform in train_transforms:
+        if "total_num_crops" in transform:
+            total_num_crops = transform["total_num_crops"]
+            multicrop_crops = transform["num_crops"]
 
     # some inference for the Info-NCE loss.
     if "simclr_info_nce_loss" in cfg.LOSS.name:
@@ -456,10 +455,35 @@ def infer_losses_config(cfg):
     # some inference for DINO loss.
     if cfg.LOSS.name == "dino_loss":
         assert len(cfg.MODEL.HEAD.PARAMS) == 1
-        assert cfg.MODEL.HEAD.PARAMS[0][0] == "swav_head"
+        assert cfg.MODEL.HEAD.PARAMS[0][0] in {
+            "swav_head",
+            "dino_head",
+            "dino_head_fsdp",
+        }
         cfg.LOSS.dino_loss.output_dim = cfg.MODEL.HEAD.PARAMS[0][1]["num_clusters"][0]
         cfg.LOSS.dino_loss.num_crops = total_num_crops or cfg.LOSS.dino_loss.num_crops
         cfg.DATA.TRAIN.COLLATE_FUNCTION = "multicrop_collator"
+
+    # some inference for the iBOT loss
+    if cfg.LOSS.name == "ibot_loss":
+        assert cfg.DATA.TRAIN.COLLATE_FUNCTION == "ibot_multicrop_masking_collator"
+        for transform in train_transforms:
+            is_vit = "vision_transformer" in cfg.MODEL.TRUNK.NAME
+            is_mim_transform = transform["name"] == "MaskedImageModeling"
+            if is_mim_transform and is_vit:
+                patch_size = cfg.MODEL.TRUNK.VISION_TRANSFORMERS.PATCH_SIZE
+                transform["patch_size"] = patch_size
+
+        # TODO(IBOT): the "num_clusters" use only works if the head is
+        #  shared between patch and class token (to enhance later)
+        assert len(cfg.MODEL.HEAD.PARAMS) == 1
+        assert cfg.MODEL.HEAD.PARAMS[0][0] in {"ibot_head"}
+        num_clusters = cfg.MODEL.HEAD.PARAMS[0][1]["out_dim"]
+        cfg.LOSS.ibot_loss.out_dim = num_clusters
+        cfg.LOSS.ibot_loss.patch_out_dim = num_clusters
+        cfg.LOSS.ibot_loss.num_epochs = cfg.OPTIMIZER.num_epochs
+        cfg.LOSS.ibot_loss.num_global_crops = multicrop_crops[0]
+        cfg.LOSS.ibot_loss.num_local_crops = total_num_crops - multicrop_crops[0]
 
     return cfg
 
@@ -474,7 +498,7 @@ def assert_transforms(cfg):
                     assert is_augly_available(), "Please pip install augly."
 
 
-def infer_fsdp(cfg):
+def infer_fsdp_setup(cfg):
     """
     inference for the FSDP settings. Conditions are:
     1) use the FSDP task
@@ -544,7 +568,7 @@ def infer_fsdp(cfg):
     return cfg
 
 
-def infer_and_assert_hydra_config(cfg):
+def infer_and_assert_hydra_config(cfg, engine_name: str):
     """
     Infer values of few parameters in the config file using the value of other config parameters
     1. Inferring losses
@@ -593,30 +617,22 @@ def infer_and_assert_hydra_config(cfg):
         ]
 
         for meter_name in meter_names:
-            # Add appropriate meters for each feature extractor layer specified.
-            if meter_name in valid_meters and is_feature_extractor_model(cfg.MODEL):
-                cfg.METERS[meter_name]["num_meters"] = len(
+            if meter_name in valid_meters:
+                feat_eval_ops_map = (
                     cfg.MODEL.FEATURE_EVAL_SETTINGS.LINEAR_EVAL_FEAT_POOL_OPS_MAP
                 )
-                cfg.METERS[meter_name]["meter_names"] = [
-                    item[0]
-                    for item in cfg.MODEL.FEATURE_EVAL_SETTINGS.LINEAR_EVAL_FEAT_POOL_OPS_MAP
-                ]
-
-    # in case of feature evaluation mode, we freeze the trunk. The Feature evaluation mode
-    # is used for the feature extraction of trunk as well. VISSL supports distributed feature
-    # extraction to speed up the extraction time. Since the model needs to be DDP for the
-    # distributed extraction, we need some dummy parameters in the model otherwise model
-    # can't be converted to DDP. So we attach some dummy head to the model.
-    world_size = cfg.DISTRIBUTED.NUM_NODES * cfg.DISTRIBUTED.NUM_PROC_PER_NODE
-    if (
-        cfg.MODEL.FEATURE_EVAL_SETTINGS.EVAL_MODE_ON
-        and cfg.MODEL.FEATURE_EVAL_SETTINGS.FREEZE_TRUNK_ONLY
-        and cfg.MODEL.FEATURE_EVAL_SETTINGS.EXTRACT_TRUNK_FEATURES_ONLY
-        and world_size > 1
-        and len(cfg.MODEL.HEAD.PARAMS) == 0
-    ):
-        cfg.MODEL.HEAD.PARAMS = [["mlp", {"dims": [2048, 1000]}]]
+                all_meter_names = [item[0] for item in feat_eval_ops_map]
+                if is_feature_extractor_model(cfg.MODEL):
+                    cfg.METERS[meter_name]["num_meters"] = len(feat_eval_ops_map)
+                    cfg.METERS[meter_name]["meter_names"] = all_meter_names
+                elif engine_name == "extract_label_predictions":
+                    if len(feat_eval_ops_map) > 0:
+                        cfg.METERS[meter_name]["num_meters"] = len(feat_eval_ops_map)
+                        cfg.METERS[meter_name]["meter_names"] = all_meter_names
+                    else:
+                        # if user is not extracting from multiple layers, we assume
+                        # the model head is being used.
+                        cfg.METERS[meter_name]["num_meters"] = 1
 
     # in SSL, during pre-training we don't want to use annotated labels or during feature
     # extraction, we don't have annotated labels for some datasets. In such cases, we set
@@ -665,7 +681,7 @@ def infer_and_assert_hydra_config(cfg):
         del cfg.OPTIMIZER.base_optimizer["head_optimizer_params"]
 
     # Infer fsdp settings
-    cfg = infer_fsdp(cfg)
+    cfg = infer_fsdp_setup(cfg)
 
     if cfg.DATA.TRAIN.BASE_DATASET == "generic_ssl":
         assert (
@@ -684,3 +700,8 @@ def infer_and_assert_hydra_config(cfg):
         # Remove CHECK_NAN hooks, as model output masking casts the logits
         # to -inf, which will throw an error from the CHECK_NAN hooks.
         cfg.HOOKS.CHECK_NAN = False
+
+    if cfg.HOOKS.EMA_MODEL.ENABLE_EMA_METERS:
+        assert cfg.METERS.get("name", "") or cfg.METERS.get(
+            "names", []
+        ), "Please specify METER.name or METER.names if you are enabling the EMA_MODEL hook."

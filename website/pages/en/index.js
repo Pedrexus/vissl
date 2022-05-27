@@ -75,6 +75,43 @@ class HomeSplash extends React.Component {
   }
 }
 
+function SocialBanner() {
+  return (
+    <div className="SocialBannerWrapper">
+      <div className="SocialBanner">
+        Support Ukraine 🇺🇦{' '}
+        <a href="https://opensource.fb.com/support-ukraine">
+          Help Provide Humanitarian Aid to Ukraine
+        </a>
+        .
+      </div>
+    </div>
+  );
+}
+
+function VideoContainer() {
+  return (
+    <div className="container text--center margin-bottom--xl">
+      <div className="row">
+        <div className="col" style={{textAlign: 'center'}}>
+          <h2>Check it out in the intro video</h2>
+          <div>
+            <iframe
+              width="560"
+              height="315"
+              src="https://www.youtube.com/embed/-0Bt-1ei7yw"
+              title="Explain Like I'm 5: VISSL"
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 class Index extends React.Component {
   render() {
     const {config: siteConfig, language = ''} = this.props;
@@ -223,7 +260,9 @@ conda install -c vissl -c iopath -c conda-forge -c pytorch -c defaults apex viss
 
     return (
       <div>
+        <SocialBanner />
         <HomeSplash siteConfig={siteConfig} language={language} />
+        <VideoContainer />
         <div className="mainContainer">
           <Features />
           <QuickStart />
