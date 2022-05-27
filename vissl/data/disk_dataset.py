@@ -9,7 +9,6 @@ import cv2
 from PIL import Image
 from iopath.common.file_io import g_pathmgr
 from torchvision.datasets import ImageFolder
-
 from vissl.data.data_helper import QueueDataset, get_mean_image
 from vissl.utils.io import load_file
 

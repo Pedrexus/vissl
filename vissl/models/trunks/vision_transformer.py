@@ -25,17 +25,20 @@ Leavitt (ito@fb.com, matthew.l.leavitt@gmail.com) and Vedanuj Goswami
 (vedanuj@fb.com).
 """
 
-import copy
 import logging
 import math
 from functools import partial
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from fairscale.nn import checkpoint_wrapper
 from vissl.config import AttrDict
 from vissl.models.model_helpers import DropPath, to_2tuple, trunc_normal_
 from vissl.models.trunks import register_model_trunk
+from vissl.utils.fsdp_utils import fsdp_wrapper
+from vissl.utils.misc import set_torch_seed
 
 
 class Mlp(nn.Module):
@@ -79,7 +82,7 @@ class Attention(nn.Module):
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version,
         # can set manually to be compat with prev weights
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = qk_scale or math.pow(head_dim, -0.5)
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -87,6 +90,16 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
+        B, N, C = x.shape
+        attn, v = self.forward_attention(x)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def forward_attention(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
@@ -101,19 +114,14 @@ class Attention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        return attn, v
 
 
 class Block(nn.Module):
     def __init__(
         self,
-        dim,
-        num_heads,
+        dim: int,
+        num_heads: int,
         mlp_ratio=4.0,
         qkv_bias=False,
         qk_scale=None,
@@ -151,6 +159,10 @@ class Block(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
+    def get_attention_map(self, x: torch.Tensor) -> torch.Tensor:
+        attn, v = self.attn.forward_attention(self.norm1(x))
+        return attn
+
 
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
@@ -159,10 +171,13 @@ class PatchEmbed(nn.Module):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        self.feat_map_size = (
+            img_size[0] // patch_size[0],
+            img_size[1] // patch_size[1],
+        )
         self.img_size = img_size
         self.patch_size = patch_size
-        self.num_patches = num_patches
+        self.num_patches = self.feat_map_size[0] * self.feat_map_size[1]
 
         self.proj = nn.Conv2d(
             in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
@@ -173,7 +188,58 @@ class PatchEmbed(nn.Module):
         return x
 
 
-@register_model_trunk("vision_transformer")
+class Fp32LayerNorm(nn.LayerNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input: torch.Tensor):
+        output = F.layer_norm(
+            input.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return output.type_as(input)
+
+
+class NoPatchMasking(nn.Module):
+    """No patch masking"""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self, x: torch.Tensor, pos_embed: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        return x + pos_embed
+
+
+class IBOTMaskedModeling(nn.Module):
+    """Block masking module inspired by iBOT (https://arxiv.org/pdf/2111.07832.pdf)
+    - contains a learn-able mask embedding
+    - replace the masked tokens by the learn-able embedding
+
+    Args:
+        embed_dim (int): size of the ViT embedding
+    """
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.masked_embed = nn.Parameter(torch.zeros(1, embed_dim))
+
+    def forward(
+        self, x: torch.Tensor, pos_embed: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        mask = kwargs.get("mask", None)
+        if mask is not None:
+            feat_map = x[:, 1:]
+            mask = mask.view(mask.shape[0], -1)
+            feat_map[mask, :] = self.masked_embed.to(x.dtype)
+        return x + pos_embed
+
+
 class VisionTransformer(nn.Module):
     """
     Vision transformer. Adding stochastic depth makes it a DeiT.
@@ -183,38 +249,37 @@ class VisionTransformer(nn.Module):
         super().__init__()
 
         assert model_config.INPUT_TYPE in ["rgb", "bgr"], "Input type not supported"
-        trunk_config = copy.deepcopy(model_config.TRUNK.VISION_TRANSFORMERS)
-
         logging.info("Building model: Vision Transformer from yaml config")
-        # Hacky workaround
-        trunk_config = AttrDict({k.lower(): v for k, v in trunk_config.items()})
 
-        img_size = trunk_config.image_size
-        patch_size = trunk_config.patch_size
-        in_chans = 3
-        embed_dim = trunk_config.hidden_dim
-        depth = trunk_config.num_layers
-        num_heads = trunk_config.num_heads
-        mlp_ratio = 4.0
-        qkv_bias = trunk_config.qkv_bias
-        qk_scale = trunk_config.qk_scale
-        drop_rate = trunk_config.dropout_rate
-        attn_drop_rate = trunk_config.attention_dropout_rate
-        drop_path_rate = trunk_config.drop_path_rate
-        hybrid_backbone_string = None
+        self.model_config = model_config
+        self.trunk_config = model_config.TRUNK.VISION_TRANSFORMERS
+        self.img_size = self.trunk_config.IMAGE_SIZE
+        self.patch_size = self.trunk_config.PATCH_SIZE
+        self.in_chans = 3
+        self.embed_dim = self.trunk_config.HIDDEN_DIM
+        self.depth = self.trunk_config.NUM_LAYERS
+        self.num_heads = self.trunk_config.NUM_HEADS
+        self.mlp_ratio = 4.0
+        self.qkv_bias = self.trunk_config.QKV_BIAS
+        self.qk_scale = self.trunk_config.QK_SCALE
+        self.drop_rate = self.trunk_config.DROPOUT_RATE
+        self.attn_drop_rate = self.trunk_config.ATTENTION_DROPOUT_RATE
+        self.drop_path_rate = self.trunk_config.DROP_PATH_RATE
+
         # TODO Implement hybrid backbones
-        if "HYBRID" in trunk_config.keys():
-            hybrid_backbone_string = trunk_config.HYBRID
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        hybrid_backbone_string = None
+        if "HYBRID" in self.trunk_config.keys():
+            hybrid_backbone_string = self.trunk_config.HYBRID
 
-        self.num_features = (
-            self.embed_dim
-        ) = embed_dim  # num_features for consistency with other models
+        norm_layer = self.create_norm_layer()
+
+        # num_features for consistency with other models
+        self.num_features = self.embed_dim
 
         # TODO : Enable Hybrid Backbones
         if hybrid_backbone_string:
             self.patch_embed = globals()[hybrid_backbone_string](
-                out_dim=embed_dim, img_size=img_size
+                out_dim=self.embed_dim, img_size=self.img_size
             )
         # if hybrid_backbone is not None:
         #     self.patch_embed = HybridEmbed(
@@ -225,37 +290,19 @@ class VisionTransformer(nn.Module):
         #     )
         else:
             self.patch_embed = PatchEmbed(
-                img_size=img_size,
-                patch_size=patch_size,
-                in_chans=in_chans,
-                embed_dim=embed_dim,
+                img_size=self.img_size,
+                patch_size=self.patch_size,
+                in_chans=self.in_chans,
+                embed_dim=self.embed_dim,
             )
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.embed_dim))
+        self.pos_drop = nn.Dropout(p=self.drop_rate)
 
-        dpr = [
-            x.item() for x in torch.linspace(0, drop_path_rate, depth)
-        ]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    dim=embed_dim,
-                    num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    qkv_bias=qkv_bias,
-                    qk_scale=qk_scale,
-                    drop=drop_rate,
-                    attn_drop=attn_drop_rate,
-                    drop_path=dpr[i],
-                    norm_layer=norm_layer,
-                )
-                for i in range(depth)
-            ]
-        )
-        self.norm = norm_layer(embed_dim)
+        self.blocks = self._build_blocks(norm_layer)
+        self.norm = norm_layer(self.embed_dim)
 
         # NOTE as per official impl, we could have a pre-logits
         # representation dense layer + tanh here
@@ -264,7 +311,50 @@ class VisionTransformer(nn.Module):
 
         trunc_normal_(self.pos_embed, std=0.02)
         trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
+
+        # Initializes the weights of the children, except for the blocks
+        # who have already been initialized in the "build_blocks".
+        for name, children in self.named_children():
+            if "blocks" not in name:
+                self._init_weights(children)
+
+        if self.trunk_config.MASKED_IMAGE_MODELING.NAME == "ibot":
+            self.patch_masking = IBOTMaskedModeling(embed_dim=self.embed_dim)
+        else:
+            self.patch_masking = NoPatchMasking()
+
+    def create_norm_layer(self):
+        return partial(nn.LayerNorm, eps=1e-6)
+
+    def _build_blocks(self, norm_layer) -> nn.ModuleList:
+        dpr = [
+            x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)
+        ]  # stochastic depth decay rule
+        blocks = []
+        for i in range(self.depth):
+            with set_torch_seed(self.model_config._MODEL_INIT_SEED + i + 1):
+                block = self._build_block(dpr[i], norm_layer)
+            blocks.append(block)
+        return nn.ModuleList(blocks)
+
+    def _build_block(self, dpr: float, norm_layer) -> nn.Module:
+        block = Block(
+            dim=self.embed_dim,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+            qkv_bias=self.qkv_bias,
+            qk_scale=self.qk_scale,
+            drop=self.drop_rate,
+            attn_drop=self.attn_drop_rate,
+            drop_path=dpr,
+            norm_layer=norm_layer,
+        )
+        block.apply(self._init_weights)
+        if self.trunk_config.CHECKPOINT_MLP:
+            block.mlp = checkpoint_wrapper(block.mlp)
+        if self.trunk_config.CHECKPOINT_BLOCK:
+            block = checkpoint_wrapper(block)
+        return block
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -279,43 +369,64 @@ class VisionTransformer(nn.Module):
     def no_weight_decay(self):
         return {"pos_embedding", "class_token"}
 
-    def prepare_tokens(self, x):
-        B = x.shape[0]
+    def prepare_tokens(self, x, **kwargs):
+        B, C, H, W = x.shape
         x = self.patch_embed(x)
+        feat_map_size = self.patch_embed.feat_map_size
 
         class_tokens = self.cls_token.expand(
             B, -1, -1
         )  # stole class_tokens impl from Phil Wang, thanks
         x = torch.cat((class_tokens, x), dim=1)
-        pos_embed = self.interpolate_pos_encoding(x, self.pos_embed)
-        x = x + pos_embed
-        x = self.pos_drop(x)
-        return x
 
-    def forward_features(self, x):
-        x = self.prepare_tokens(x)
+        # Compute positional embedding
+        pos_embed = self.interpolate_pos_encoding(x, self.pos_embed, feat_map_size)
 
+        # Use the mask generator to create a mask, apply it, and
+        # combine the result with the positional embeddings
+        x = self.patch_masking(x, pos_embed, **kwargs)
+
+        # Return sequence of shape (B, 1 + H * W, C)
+        return self.pos_drop(x)
+
+    def forward_features(
+        self, x: torch.Tensor, only_class_token: bool = True, **kwargs
+    ):
+        """
+        Return the class token representation at the last layer
+        """
+        x = self.prepare_tokens(x, **kwargs)
         for blk in self.blocks:
             x = blk(x)
-
         x = self.norm(x)
-        return x[:, 0]
+        if only_class_token:
+            return x[:, 0]
+        else:
+            return x
 
-    def get_intermediate_features(self, x, names):
+    def get_intermediate_features(
+        self, x: torch.Tensor, names: List[str]
+    ) -> List[torch.Tensor]:
+        """
+        Given a list of feature names, return a list of the same length
+        where each output correspond to the desired feature.
+
+        The available features are:
+        - blkCLS[integer] => CLS token of blk[integer]
+        - concatCLS[integer] => concat of CLS token from last #"integer" blocks
+        - lastCLS => CLS token of last block
+        - lastMAP => feature map of the last block
+        - lastBLK => CLS token + feature map of the last block
+        """
+
+        # Get feature from every intermediate block and apply norm
         interms = []
-
         x = self.prepare_tokens(x)
-
-        # get feature from every intermediate block and apply norm
         for blk in self.blocks:
             x = blk(x)
             interms.append(self.norm(x))
 
-        # feature names are as follows
-        # blkCLS[integer] => CLS token of blk[integer]
-        # concatCLS[integer] => concat of CLS token from last #"integer" blocks
-        # lastCLS => CLS token of last block
-
+        # Then collect the desired features
         output = []
         for name in names:
             if name.startswith("blkCLS"):
@@ -327,13 +438,40 @@ class VisionTransformer(nn.Module):
                 output.append(feat)
             elif name == "lastCLS":
                 output.append(interms[-1][:, 0])
+            elif name == "lastMAP":
+                feat_map_size = self.patch_embed.feat_map_size
+                feat_map = interms[-1][:, 1:]
+                B, L, C = feat_map.shape
+                feat_map = feat_map.reshape((B, *feat_map_size, C))
+                output.append(feat_map)
+            elif name == "lastBLK":
+                output.append(interms[-1])
         return output
 
+    def get_last_self_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Get the attention map from the last layer, with dimensions:
+        (batch_size, num_heads, seq_len + 1, seq_len + 1)
+        """
+        x = self.prepare_tokens(x)
+        for i, blk in enumerate(self.blocks):
+            if i < len(self.blocks) - 1:
+                x = blk(x)
+            else:
+                # return attention of the last block
+                return blk.get_attention_map(x)
+
     def forward(
-        self, x: torch.Tensor, out_feat_keys: List[str] = None
+        self, x: torch.Tensor, out_feat_keys: List[str] = None, **kwargs
     ) -> List[torch.Tensor]:
         if out_feat_keys is None or len(out_feat_keys) == 0:
-            x = self.forward_features(x)
+            x = self.forward_features(x, **kwargs)
+            x = x.unsqueeze(0)
+        elif len(out_feat_keys) == 1 and out_feat_keys[0] == "lastBLK":
+            # Small optimization for cases where we want the full output
+            # but not interested in intermediate features
+            # TODO - extend to len(out_feat_keys) == 1
+            x = self.forward_features(x, only_class_token=False, **kwargs)
             x = x.unsqueeze(0)
         else:
             # we specified a feature layer name. Follow DINO
@@ -341,20 +479,56 @@ class VisionTransformer(nn.Module):
             x = self.get_intermediate_features(x, out_feat_keys)
         return x
 
-    def interpolate_pos_encoding(self, x, pos_embed):
+    def interpolate_pos_encoding(
+        self, x: torch.Tensor, pos_embed: torch.Tensor, feat_map_size: Tuple[int, int]
+    ) -> torch.Tensor:
         npatch = x.shape[1] - 1
-        N = pos_embed.shape[1] - 1
-        if npatch == N:
+        nembed = pos_embed.shape[1] - 1
+        if npatch == nembed:
             return pos_embed
+
+        # Remove the class embedding and compute the interpolation scale factor
         class_emb = pos_embed[:, 0]
         pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
+        height, width = feat_map_size
+        scale_factor = math.sqrt(npatch / nembed)
+
+        # Interpolate the position embeddings
+        pos_embed = pos_embed.reshape(1, height, width, dim).permute(0, 3, 1, 2)
         pos_embed = nn.functional.interpolate(
-            pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(
-                0, 3, 1, 2
-            ),
-            scale_factor=math.sqrt(npatch / N),
+            pos_embed,
+            scale_factor=scale_factor,
             mode="bicubic",
         )
         pos_embed = pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+
+        # Add the class embedding back and return this
         return torch.cat((class_emb.unsqueeze(0), pos_embed), dim=1)
+
+
+class VisionTransformerFSDPImpl(VisionTransformer):
+    def create_norm_layer(self):
+        return partial(Fp32LayerNorm, eps=1e-6)
+
+    def _build_block(self, dpr: float, norm_layer) -> nn.Module:
+        block = super()._build_block(dpr, norm_layer)
+        block = fsdp_wrapper(block, **self.model_config["FSDP_CONFIG"])
+        return block
+
+
+@register_model_trunk("vision_transformer")
+def VisionTransformerDDP(model_config: AttrDict, model_name: str):
+    with set_torch_seed(model_config._MODEL_INIT_SEED):
+        return VisionTransformer(model_config, model_name)
+
+
+@register_model_trunk("vision_transformer_fsdp")
+def VisionTransformerFSDP(model_config: AttrDict, model_name: str):
+    """
+    Wrap the entire trunk since we need to load checkpoint before
+    train_fsdp_task.py wrapping happens.
+    """
+    with set_torch_seed(model_config._MODEL_INIT_SEED):
+        vit = VisionTransformerFSDPImpl(model_config, model_name).cuda()
+    return fsdp_wrapper(vit, **model_config.FSDP_CONFIG)

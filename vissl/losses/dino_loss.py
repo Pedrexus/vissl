@@ -16,6 +16,7 @@ from classy_vision.generic.distributed_util import (
     is_distributed_training_run,
 )
 from classy_vision.losses import ClassyLoss, register_loss
+from fairscale.nn import FullyShardedDataParallel
 from vissl.config import AttrDict
 from vissl.models.model_helpers import get_no_ddp_model
 
@@ -24,11 +25,22 @@ from vissl.models.model_helpers import get_no_ddp_model
 class DINOLoss(ClassyLoss):
     def __init__(self, loss_config: AttrDict):
         super().__init__()
+
+        # Store loss configuration for DINOHook to access
+        self.teacher_momentum = loss_config["momentum"]
+        self.teacher_temp_min = loss_config["teacher_temp_min"]
+        self.teacher_temp_max = loss_config["teacher_temp_max"]
+        self.teacher_temp_warmup_iters = loss_config["teacher_temp_warmup_iters"]
+        self.crops_for_teacher = loss_config["crops_for_teacher"]
         self.loss_config = loss_config
+
+        # Momentum teacher related attributes
         self.momentum_teacher = None
         self.checkpoint = None
         self.teacher_output = None
         self.teacher_temp = None
+
+        # Loss center related attributes
         self.is_distributed = is_distributed_training_run()
         self.use_gpu = get_cuda_device_index() > -1
         self.register_buffer("center", torch.zeros(1, loss_config["output_dim"]))
@@ -46,6 +58,22 @@ class DINOLoss(ClassyLoss):
         """
         return cls(loss_config)
 
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
+        """
+        Return the state dictionary for the loss:
+        - For DDP model, we rely on the default implementation of PyTorch
+        - For FSDP model, we only return a shard of the teacher model and
+          each rank will do the same, limiting memory consumption
+        """
+        if isinstance(self.momentum_teacher, FullyShardedDataParallel):
+            return {
+                "center": self.center.data,
+                "teacher": self.momentum_teacher.local_state_dict(),
+                "teacher_meta": self.momentum_teacher.local_metadata_dict(),
+            }
+        else:
+            return super().state_dict(destination, prefix, keep_vars)
+
     def load_state_dict(self, state_dict, *args, **kwargs):
         """
         Restore the loss state given a checkpoint
@@ -54,14 +82,20 @@ class DINOLoss(ClassyLoss):
             state_dict (serialized via torch.save)
         """
 
-        # If the encoder has been allocated, use the normal pytorch restoration
+        # If the teacher not not been yet allocated, store it to load it
+        # once the momentum teacher is available
         if self.momentum_teacher is None:
             self.checkpoint = state_dict
             logging.info("Storing the checkpoint for later use")
-        else:
-            logging.info("Restoring checkpoint")
-            teacher_model = get_no_ddp_model(self.momentum_teacher)
+            return
 
+        # If the encoder has been allocated, use the normal pytorch restoration
+        logging.info("Restoring checkpoint")
+        if isinstance(self.momentum_teacher, FullyShardedDataParallel):
+            self.momentum_teacher.load_local_state_dict(state_dict["teacher"])
+            self.center.copy_(state_dict["center"])
+        else:
+            teacher_model = get_no_ddp_model(self.momentum_teacher)
             # teacher params
             sd = {
                 x.replace("momentum_teacher.module.", ""): state_dict[x]
@@ -91,8 +125,10 @@ class DINOLoss(ClassyLoss):
         batch_center = batch_center / (len(self.teacher_output) * get_world_size())
 
         # ema update
-        m = self.loss_config.ema_center
-        self.center = self.center * m + batch_center * (1 - m)
+        center_momentum = self.loss_config.ema_center
+        self.center = self.center * center_momentum + batch_center * (
+            1 - center_momentum
+        )
 
     def forward(self, output: List[torch.Tensor], *args, **kwargs):
         student_out = output[-1] / self.loss_config["student_temp"]

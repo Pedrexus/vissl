@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from iopath.common.download import download
-from iopath.common.file_io import g_pathmgr, file_lock
+from iopath.common.file_io import file_lock, g_pathmgr
 from vissl.utils.slurm import get_slurm_dir
 
 
@@ -90,7 +90,7 @@ def save_file(data, filename, append_to_json=True, verbose=True):
         logging.info(f"Saved data to file: {filename}")
 
 
-def load_file(filename, mmap_mode=None):
+def load_file(filename, mmap_mode=None, verbose=True, allow_pickle=False):
     """
     Common i/o utility to handle loading data from various file formats.
     Supported:
@@ -99,7 +99,9 @@ def load_file(filename, mmap_mode=None):
     If the mmap_mode of reading is not successful, we load data without the
     mmap_mode.
     """
-    logging.info(f"Loading data from file: {filename}")
+    if verbose:
+        logging.info(f"Loading data from file: {filename}")
+
     file_ext = os.path.splitext(filename)[1]
     if file_ext == ".txt":
         with g_pathmgr.open(filename, "r") as fopen:
@@ -111,20 +113,30 @@ def load_file(filename, mmap_mode=None):
         if mmap_mode:
             try:
                 with g_pathmgr.open(filename, "rb") as fopen:
-                    data = np.load(fopen, encoding="latin1", mmap_mode=mmap_mode)
+                    data = np.load(
+                        fopen,
+                        allow_pickle=allow_pickle,
+                        encoding="latin1",
+                        mmap_mode=mmap_mode,
+                    )
             except ValueError as e:
                 logging.info(
                     f"Could not mmap {filename}: {e}. Trying without g_pathmgr"
                 )
-                data = np.load(filename, encoding="latin1", mmap_mode=mmap_mode)
+                data = np.load(
+                    filename,
+                    allow_pickle=allow_pickle,
+                    encoding="latin1",
+                    mmap_mode=mmap_mode,
+                )
                 logging.info("Successfully loaded without g_pathmgr")
             except Exception:
                 logging.info("Could not mmap without g_pathmgr. Trying without mmap")
                 with g_pathmgr.open(filename, "rb") as fopen:
-                    data = np.load(fopen, encoding="latin1")
+                    data = np.load(fopen, allow_pickle=allow_pickle, encoding="latin1")
         else:
             with g_pathmgr.open(filename, "rb") as fopen:
-                data = np.load(fopen, encoding="latin1")
+                data = np.load(fopen, allow_pickle=allow_pickle, encoding="latin1")
     elif file_ext == ".json":
         with g_pathmgr.open(filename, "r") as fopen:
             data = json.load(fopen)
@@ -188,7 +200,7 @@ def get_file_size(filename):
     """
     Given a file, get the size of file in MB
     """
-    size_in_mb = os.path.getsize(filename) / float(1024 ** 2)
+    size_in_mb = os.path.getsize(filename) / float(1024**2)
     return size_in_mb
 
 

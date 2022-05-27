@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 import pprint
 import re
 import sys
@@ -293,7 +294,7 @@ def infer_learning_rate(cfg):
 
         scale_factor = float(batch_size) / base_lr_batch_size
         if scaling_type == "sqrt":
-            scale_factor = scale_factor ** 0.5
+            scale_factor = math.pow(scale_factor, 0.5)
         scaled_lr = base_lr * scale_factor
         cfg.OPTIMIZER.param_schedulers.lr = get_scaled_lr_scheduler(
             cfg, param_schedulers, scaled_lr
@@ -324,7 +325,7 @@ def infer_learning_rate(cfg):
 
         scale_factor = float(batch_size) / base_lr_batch_size
         if scaling_type == "sqrt":
-            scale_factor = scale_factor ** 0.5
+            scale_factor = math.pow(scale_factor, 0.5)
         scaled_lr = base_lr * scale_factor
         cfg.OPTIMIZER.param_schedulers.lr_head = get_scaled_lr_scheduler(
             cfg, param_schedulers, scaled_lr
@@ -351,14 +352,12 @@ def infer_losses_config(cfg):
     training in case user forgets to adjust all the parameters.
     """
     train_transforms = cfg.DATA.TRAIN.TRANSFORMS
-    total_num_crops = next(
-        (
-            transform["total_num_crops"]
-            for transform in train_transforms
-            if "total_num_crops" in transform
-        ),
-        None,
-    )
+    total_num_crops = None
+    multicrop_crops = []
+    for transform in train_transforms:
+        if "total_num_crops" in transform:
+            total_num_crops = transform["total_num_crops"]
+            multicrop_crops = transform["num_crops"]
 
     # some inference for the Info-NCE loss.
     if "simclr_info_nce_loss" in cfg.LOSS.name:
@@ -456,10 +455,35 @@ def infer_losses_config(cfg):
     # some inference for DINO loss.
     if cfg.LOSS.name == "dino_loss":
         assert len(cfg.MODEL.HEAD.PARAMS) == 1
-        assert cfg.MODEL.HEAD.PARAMS[0][0] == "swav_head"
+        assert cfg.MODEL.HEAD.PARAMS[0][0] in {
+            "swav_head",
+            "dino_head",
+            "dino_head_fsdp",
+        }
         cfg.LOSS.dino_loss.output_dim = cfg.MODEL.HEAD.PARAMS[0][1]["num_clusters"][0]
         cfg.LOSS.dino_loss.num_crops = total_num_crops or cfg.LOSS.dino_loss.num_crops
         cfg.DATA.TRAIN.COLLATE_FUNCTION = "multicrop_collator"
+
+    # some inference for the iBOT loss
+    if cfg.LOSS.name == "ibot_loss":
+        assert cfg.DATA.TRAIN.COLLATE_FUNCTION == "ibot_multicrop_masking_collator"
+        for transform in train_transforms:
+            is_vit = "vision_transformer" in cfg.MODEL.TRUNK.NAME
+            is_mim_transform = transform["name"] == "MaskedImageModeling"
+            if is_mim_transform and is_vit:
+                patch_size = cfg.MODEL.TRUNK.VISION_TRANSFORMERS.PATCH_SIZE
+                transform["patch_size"] = patch_size
+
+        # TODO(IBOT): the "num_clusters" use only works if the head is
+        #  shared between patch and class token (to enhance later)
+        assert len(cfg.MODEL.HEAD.PARAMS) == 1
+        assert cfg.MODEL.HEAD.PARAMS[0][0] in {"ibot_head"}
+        num_clusters = cfg.MODEL.HEAD.PARAMS[0][1]["out_dim"]
+        cfg.LOSS.ibot_loss.out_dim = num_clusters
+        cfg.LOSS.ibot_loss.patch_out_dim = num_clusters
+        cfg.LOSS.ibot_loss.num_epochs = cfg.OPTIMIZER.num_epochs
+        cfg.LOSS.ibot_loss.num_global_crops = multicrop_crops[0]
+        cfg.LOSS.ibot_loss.num_local_crops = total_num_crops - multicrop_crops[0]
 
     return cfg
 
@@ -676,3 +700,8 @@ def infer_and_assert_hydra_config(cfg, engine_name: str):
         # Remove CHECK_NAN hooks, as model output masking casts the logits
         # to -inf, which will throw an error from the CHECK_NAN hooks.
         cfg.HOOKS.CHECK_NAN = False
+
+    if cfg.HOOKS.EMA_MODEL.ENABLE_EMA_METERS:
+        assert cfg.METERS.get("name", "") or cfg.METERS.get(
+            "names", []
+        ), "Please specify METER.name or METER.names if you are enabling the EMA_MODEL hook."
