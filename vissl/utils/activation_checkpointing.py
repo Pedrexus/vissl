@@ -33,7 +33,7 @@ def manual_sync_params(model: DistributedDataParallel) -> None:
     """
     _orig = model.require_forward_param_sync
     model.require_forward_param_sync = True
-    model._sync_params()
+    model._sync_param()
     model.require_forward_param_sync = _orig
 
 
