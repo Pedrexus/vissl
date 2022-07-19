@@ -456,7 +456,7 @@ class SelfSupervisionTrainer(object):
                 assert isinstance(sample, dict)
                 assert "data_idx" in sample, "Indices not passed"
                 input_sample = {
-                    "input": torch.cat(sample["data"]).cuda(non_blocking=True),
+                    "input": torch.cat(sample["data"]),
                     "target": torch.cat(sample["label"]).cpu().numpy(),
                     "inds": torch.cat(sample["data_idx"]).cpu().numpy(),
                 }
