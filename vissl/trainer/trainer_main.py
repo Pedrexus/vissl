@@ -354,7 +354,7 @@ class SelfSupervisionTrainer(object):
         the user wants.
         """
         # support feature/label predictions extraction on gpu only.
-        assert self.task.device.type == "cuda", "Set MACHINE.DEVICE = gpu"
+        # FIXME: assert self.task.device.type == "cuda", "Set MACHINE.DEVICE = gpu"
         self.task.prepare_extraction(pin_memory=self.cfg.DATA.PIN_MEMORY)
 
         # Create distributed model
